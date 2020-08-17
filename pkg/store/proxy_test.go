@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
@@ -1616,7 +1617,7 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 		var resps []*storepb.SeriesResponse
 
 		head, created := storetestutil.CreateHeadWithSeries(t, j, storetestutil.HeadGenOptions{
-			Dir:              tmpDir,
+			TSDBDir:          filepath.Join(tmpDir, fmt.Sprintf("%d", j)),
 			SamplesPerSeries: samplesPerSeriesPerClient,
 			Series:           seriesPerClient,
 			MaxFrameBytes:    storetestutil.RemoteReadFrameLimit,
@@ -1626,7 +1627,7 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 		testutil.Ok(t, head.Close())
 
 		for i := 0; i < len(created); i++ {
-			resps = append(resps, storepb.NewSeriesResponse(&created[i]))
+			resps = append(resps, storepb.NewSeriesResponse(created[i]))
 		}
 
 		clients[j] = &testClient{
@@ -1647,7 +1648,7 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 	}
 
 	var allResps []*storepb.SeriesResponse
-	var expected []storepb.Series
+	var expected []*storepb.Series
 	lastLabels := storepb.Series{}
 	for _, c := range clients {
 		m := c.(*testClient).StoreClient.(*mockedStoreAPI)
@@ -1663,7 +1664,7 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 				continue
 			}
 			lastLabels = x
-			expected = append(expected, *r.GetSeries())
+			expected = append(expected, r.GetSeries())
 		}
 
 	}
@@ -1700,7 +1701,7 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 	// In this we expect exactly the same response as input.
 	expected = expected[:0]
 	for _, r := range allResps {
-		expected = append(expected, *r.GetSeries())
+		expected = append(expected, r.GetSeries())
 	}
 	storetestutil.TestServerSeries(t, store,
 		&storetestutil.SeriesCase{

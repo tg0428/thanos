@@ -5,15 +5,23 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"io/ioutil"
 	"math"
+	"math/rand"
+	"os"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
@@ -394,4 +402,249 @@ func TestTSDBStore_Series_SplitSamplesIntoChunksWithMaxSizeOf120(t *testing.T) {
 
 		return tsdbStore
 	})
+}
+
+// Regression test for: https://github.com/thanos-io/thanos/issues/3013 .
+func TestTSDBStore_SeriesChunkBytesCopied(t *testing.T) {
+	tmpDir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	t.Cleanup(func() {
+		testutil.Ok(t, os.RemoveAll(tmpDir))
+	})
+
+	var (
+		random = rand.New(rand.NewSource(120))
+		logger = log.NewNopLogger()
+	)
+
+	// Generate one series in two parts. Put first part in block, second in just WAL.
+	head, _ := storetestutil.CreateHeadWithSeries(t, 0, storetestutil.HeadGenOptions{
+		TSDBDir:          tmpDir,
+		SamplesPerSeries: 300,
+		Series:           2,
+		Random:           random,
+		SkipChunks:       true,
+	})
+	_ = createBlockFromHead(t, tmpDir, head)
+	testutil.Ok(t, head.Close())
+
+	head, _ = storetestutil.CreateHeadWithSeries(t, 1, storetestutil.HeadGenOptions{
+		TSDBDir:          tmpDir,
+		SamplesPerSeries: 300,
+		Series:           2,
+		WithWAL:          true,
+		Random:           random,
+		SkipChunks:       true,
+	})
+	testutil.Ok(t, head.Close())
+
+	db, err := tsdb.OpenDBReadOnly(tmpDir, logger)
+	testutil.Ok(t, err)
+
+	extLabels := labels.FromStrings("ext", "1")
+	store := NewTSDBStore(logger, nil, &mockedStartTimeDB{DBReadOnly: db, startTime: 0}, component.Receive, extLabels)
+
+	t.Cleanup(func() {
+		if db != nil {
+			testutil.Ok(t, db.Close())
+		}
+	})
+
+	// Call series.
+	srv := storetestutil.NewSeriesServer(context.Background())
+	t.Run("call series and access results", func(t *testing.T) {
+		testutil.Ok(t, store.Series(&storepb.SeriesRequest{
+			MinTime: 0,
+			MaxTime: math.MaxInt64,
+			Matchers: []storepb.LabelMatcher{
+				{Type: storepb.LabelMatcher_EQ, Name: "foo", Value: "bar"},
+			},
+			PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
+		}, srv))
+		testutil.Equals(t, 0, len(srv.Warnings))
+		testutil.Equals(t, 0, len(srv.HintsSet))
+		testutil.Equals(t, 4, len(srv.SeriesSet))
+
+		// All chunks should be accessible for read and write (copied).
+		for _, s := range srv.SeriesSet {
+			testutil.Equals(t, 3, len(s.Chunks))
+			for _, c := range s.Chunks {
+				testutil.Ok(t, testutil.FaultOrPanicToErr(func() {
+					_ = string(c.Raw.Data) // Access bytes by converting them to different type.
+				}))
+				testutil.Ok(t, testutil.FaultOrPanicToErr(func() {
+					c.Raw.Data[0] = 0 // Check if we can write to the byte range.
+				}))
+			}
+		}
+	})
+	t.Run("flush WAL and access results", func(t *testing.T) {
+		testutil.Ok(t, db.FlushWAL(tmpDir))
+
+		// All chunks should be still accessible for read and write (copied).
+		for _, s := range srv.SeriesSet {
+			for _, c := range s.Chunks {
+				testutil.Ok(t, testutil.FaultOrPanicToErr(func() {
+					_ = string(c.Raw.Data) // Access bytes by converting them to different type.
+				}))
+				testutil.Ok(t, testutil.FaultOrPanicToErr(func() {
+					c.Raw.Data[0] = 0 // Check if we can write to the byte range.
+				}))
+			}
+		}
+	})
+
+	t.Run("close db with block readers and access results", func(t *testing.T) {
+		// This should not block, as select finished.
+		testutil.Ok(t, db.Close())
+		db = nil
+
+		// All chunks should be still accessible for read and write (copied).
+		for _, s := range srv.SeriesSet {
+			for _, c := range s.Chunks {
+				testutil.Ok(t, testutil.FaultOrPanicToErr(func() {
+					_ = string(c.Raw.Data) // Access bytes by converting them to different type.
+				}))
+				testutil.Ok(t, testutil.FaultOrPanicToErr(func() {
+					c.Raw.Data[0] = 0 // Check if we can write to the byte range.
+				}))
+			}
+		}
+	})
+}
+
+func TestTSDBStoreSeries(t *testing.T) {
+	tb := testutil.NewTB(t)
+	storetestutil.RunSeriesInterestingCases(tb, 10e6, 10e5, func(t testutil.TB, samplesPerSeries, series int) {
+		benchTSDBStoreSeries(t, samplesPerSeries, series)
+	})
+}
+
+func BenchmarkTSDBStoreSeries(b *testing.B) {
+	tb := testutil.NewTB(b)
+	storetestutil.RunSeriesInterestingCases(tb, 10e6, 10e5, func(t testutil.TB, samplesPerSeries, series int) {
+		benchTSDBStoreSeries(t, samplesPerSeries, series)
+	})
+}
+
+func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
+	tmpDir, err := ioutil.TempDir("", "testorbench-testtsdbseries")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpDir)) }()
+
+	// This means 3 blocks and the head.
+	const numOfBlocks = 4
+
+	samplesPerSeriesPerBlock := totalSamples / numOfBlocks
+	if samplesPerSeriesPerBlock == 0 {
+		samplesPerSeriesPerBlock = 1
+	}
+	seriesPerBlock := totalSeries / numOfBlocks
+	if seriesPerBlock == 0 {
+		seriesPerBlock = 1
+	}
+
+	var (
+		resps  = make([][]*storepb.SeriesResponse, 4)
+		random = rand.New(rand.NewSource(120))
+		logger = log.NewNopLogger()
+	)
+
+	for j := 0; j < 3; j++ {
+		head, created := storetestutil.CreateHeadWithSeries(t, j, storetestutil.HeadGenOptions{
+			TSDBDir:          tmpDir,
+			SamplesPerSeries: samplesPerSeriesPerBlock,
+			Series:           seriesPerBlock,
+			Random:           random,
+			SkipChunks:       t.IsBenchmark(),
+		})
+		for i := 0; i < len(created); i++ {
+			resps[j] = append(resps[j], storepb.NewSeriesResponse(created[i]))
+		}
+
+		_ = createBlockFromHead(t, tmpDir, head)
+		testutil.Ok(t, head.Close())
+	}
+
+	head, created := storetestutil.CreateHeadWithSeries(t, 3, storetestutil.HeadGenOptions{
+		TSDBDir:          tmpDir,
+		SamplesPerSeries: samplesPerSeriesPerBlock,
+		Series:           seriesPerBlock,
+		WithWAL:          true,
+		Random:           random,
+		SkipChunks:       t.IsBenchmark(),
+	})
+	testutil.Ok(t, head.Close())
+
+	for i := 0; i < len(created); i++ {
+		resps[3] = append(resps[3], storepb.NewSeriesResponse(created[i]))
+	}
+
+	db, err := tsdb.OpenDBReadOnly(tmpDir, logger)
+	testutil.Ok(t, err)
+
+	defer func() { testutil.Ok(t, db.Close()) }()
+
+	extLabels := labels.FromStrings("ext", "1")
+	store := NewTSDBStore(logger, nil, &mockedStartTimeDB{DBReadOnly: db, startTime: 0}, component.Receive, extLabels)
+
+	var expected []*storepb.Series
+	var lastLabels storepb.Series
+	var frameBytesLeft int
+	for _, resp := range resps {
+		for _, r := range resp {
+			// TSDB Store splits into multiple frames based on maxBytesPerFrame option. Prepare for that.
+
+			// Add external labels.
+			x := storepb.Series{
+				Labels: make([]storepb.Label, 0, len(r.GetSeries().Labels)+len(extLabels)),
+			}
+			for _, l := range r.GetSeries().Labels {
+				x.Labels = append(x.Labels, storepb.Label{
+					Name:  l.Name,
+					Value: l.Value,
+				})
+			}
+			for _, l := range extLabels {
+				x.Labels = append(x.Labels, storepb.Label{
+					Name:  l.Name,
+					Value: l.Value,
+				})
+			}
+			sort.Slice(x.Labels, func(i, j int) bool {
+				return x.Labels[i].Name < x.Labels[j].Name
+			})
+
+			for _, c := range r.GetSeries().Chunks {
+				if x.String() == lastLabels.String() && frameBytesLeft > 0 {
+					expected[len(expected)-1].Chunks = append(expected[len(expected)-1].Chunks, c)
+					frameBytesLeft -= c.Size()
+					continue
+				}
+
+				frameBytesLeft = store.maxBytesPerFrame
+				for _, lbl := range x.Labels {
+					frameBytesLeft -= lbl.Size()
+				}
+				lastLabels = x
+				expected = append(expected, &storepb.Series{Labels: x.Labels, Chunks: []storepb.AggrChunk{c}})
+				frameBytesLeft -= c.Size()
+			}
+		}
+	}
+
+	storetestutil.TestServerSeries(t, store,
+		&storetestutil.SeriesCase{
+			Name: fmt.Sprintf("%d blocks and one WAL with %d samples, %d series each", numOfBlocks-1, samplesPerSeriesPerBlock, seriesPerBlock),
+			Req: &storepb.SeriesRequest{
+				MinTime: 0,
+				MaxTime: math.MaxInt64,
+				Matchers: []storepb.LabelMatcher{
+					{Type: storepb.LabelMatcher_EQ, Name: "foo", Value: "bar"},
+				},
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
+			},
+			ExpectedSeries: expected,
+		},
+	)
 }

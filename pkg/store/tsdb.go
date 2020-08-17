@@ -116,28 +116,27 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 	}
 	defer runutil.CloseWithLogOnErr(s.logger, q, "close tsdb querier series")
 
-	var (
-		set        = q.Select(false, nil, matchers...)
-		respSeries storepb.Series
-	)
+	set := q.Select(false, nil, matchers...)
 
 	// Stream at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
 	for set.Next() {
 		series := set.At()
-		respSeries.Labels = s.translateAndExtendLabels(series.Labels(), s.externalLabels)
-		respSeries.Chunks = respSeries.Chunks[:0]
+		seriesLabels := storepb.Series{Labels: s.translateAndExtendLabels(series.Labels(), s.externalLabels)}
 		if r.SkipChunks {
-			if err := srv.Send(storepb.NewSeriesResponse(&respSeries)); err != nil {
+			if err := srv.Send(storepb.NewSeriesResponse(&seriesLabels)); err != nil {
 				return status.Error(codes.Aborted, err.Error())
 			}
 			continue
 		}
 
-		frameBytesLeft := s.maxBytesPerFrame
-		for _, lbl := range respSeries.Labels {
-			frameBytesLeft -= lbl.Size()
+		bytesLeftForChunks := s.maxBytesPerFrame
+		for _, lbl := range seriesLabels.Labels {
+			bytesLeftForChunks -= lbl.Size()
 		}
+		frameBytesLeft := bytesLeftForChunks
 
+		// Share? 	respSeries.Chunks = respSeries.Chunks[:0]
+		seriesChunks := []storepb.AggrChunk{}
 		chIter := series.Iterator()
 		isNext := chIter.Next()
 		for isNext {
@@ -146,15 +145,16 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 				return status.Errorf(codes.Internal, "TSDBStore: found not populated chunk returned by SeriesSet at ref: %v", chk.Ref)
 			}
 
-			respSeries.Chunks = append(respSeries.Chunks, storepb.AggrChunk{
+			c := storepb.AggrChunk{
 				MinTime: chk.MinTime,
 				MaxTime: chk.MaxTime,
 				Raw: &storepb.Chunk{
 					Type: storepb.Chunk_Encoding(chk.Chunk.Encoding() - 1), // Proto chunk encoding is one off to TSDB one.
 					Data: chk.Chunk.Bytes(),
 				},
-			})
-			frameBytesLeft -= respSeries.Chunks[len(respSeries.Chunks)-1].Size()
+			}
+			frameBytesLeft -= c.Size()
+			seriesChunks = append(seriesChunks, c)
 
 			// We are fine with minor inaccuracy of max bytes per frame. The inaccuracy will be max of full chunk size.
 			isNext = chIter.Next()
@@ -162,10 +162,11 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 				continue
 			}
 
-			if err := srv.Send(storepb.NewSeriesResponse(&respSeries)); err != nil {
+			if err := srv.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: seriesLabels.Labels, Chunks: seriesChunks})); err != nil {
 				return status.Error(codes.Aborted, err.Error())
 			}
-			respSeries.Chunks = respSeries.Chunks[:0]
+			frameBytesLeft = bytesLeftForChunks
+			seriesChunks = []storepb.AggrChunk{}
 		}
 		if err := chIter.Err(); err != nil {
 			return status.Error(codes.Internal, errors.Wrap(err, "chunk iter").Error())

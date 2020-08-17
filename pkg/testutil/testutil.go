@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/pkg/errors"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -151,4 +153,20 @@ func GatherAndCompare(t *testing.T, g1 prometheus.Gatherer, g2 prometheus.Gather
 		}
 	}
 	Equals(t, m1.String(), m2.String())
+}
+
+// FaultOrPanicToErr returns error if panic of fault was triggered during execution of function.
+func FaultOrPanicToErr(f func()) (err error) {
+	// Set this go routine to panic on segfault to allow asserting on those.
+	debug.SetPanicOnFault(true)
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.Errorf("invoked function panicked or caused segmentation fault: %v", r)
+		}
+		debug.SetPanicOnFault(false)
+	}()
+
+	f()
+
+	return err
 }
